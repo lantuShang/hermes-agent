@@ -54,6 +54,16 @@ class TestCodexBuildKwargs:
         assert "input" in kw
         assert kw["store"] is False
 
+    def test_timeout_forwarded_to_responses_api(self, transport):
+        messages = [{"role": "user", "content": "Hi"}]
+        kw = transport.build_kwargs(
+            model="gpt-5.4",
+            messages=messages,
+            tools=[],
+            timeout=1800.0,
+        )
+        assert kw["timeout"] == 1800.0
+
     def test_system_extracted_from_messages(self, transport):
         messages = [
             {"role": "system", "content": "Custom system prompt"},

@@ -116,6 +116,10 @@ class ResponsesApiTransport(ProviderTransport):
         elif not is_github_responses and not is_xai_responses:
             kwargs["include"] = []
 
+        timeout = params.get("timeout")
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+
         request_overrides = params.get("request_overrides")
         if request_overrides:
             kwargs.update(request_overrides)
