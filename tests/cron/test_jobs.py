@@ -21,6 +21,7 @@ from cron.jobs import (
     resume_job,
     remove_job,
     mark_job_run,
+    trigger_job,
     advance_next_run,
     get_due_jobs,
     save_job_output,
@@ -451,6 +452,67 @@ class TestMarkJobRun:
         assert updated["next_run_at"] is None
         assert updated["enabled"] is False
         assert updated["state"] == "completed"
+
+
+class TestManualTrigger:
+    """Regression tests for `hermes cron run` manual triggers."""
+
+    def test_triggered_recurring_job_runs_even_after_catchup_grace(self, tmp_cron_dir, monkeypatch):
+        """A manual trigger must not be treated as a stale missed schedule.
+
+        `hermes cron run` can be issued while the gateway ticker is stopped,
+        blocked, or between long ticks.  Before the manual-trigger marker, a
+        recurring job whose `next_run_at` was set to "now" could be
+        fast-forwarded instead of executed once it was older than the recurring
+        schedule's catch-up grace window.
+        """
+        pytest.importorskip("croniter")
+        requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: requested_at)
+        job = create_job(prompt="Manual run", schedule="0 14 * * 1-5")
+
+        triggered = trigger_job(job["id"])
+
+        assert triggered is not None
+        assert triggered["next_run_at"] == requested_at.isoformat()
+        assert triggered["manual_triggered_at"] == requested_at.isoformat()
+
+        # More than the 2h max catch-up grace for daily cron schedules.
+        later = requested_at + timedelta(hours=3)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: later)
+
+        due = get_due_jobs()
+
+        assert [j["id"] for j in due] == [job["id"]]
+        assert get_job(job["id"])["next_run_at"] == requested_at.isoformat()
+
+    def test_advance_next_run_does_not_consume_manual_trigger(self, tmp_cron_dir, monkeypatch):
+        """Scheduler pre-advance should not erase a pending manual run."""
+        requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: requested_at)
+        job = create_job(prompt="Manual interval", schedule="every 1h")
+        trigger_job(job["id"])
+
+        assert advance_next_run(job["id"]) is False
+        updated = get_job(job["id"])
+        assert updated["next_run_at"] == requested_at.isoformat()
+        assert updated["manual_triggered_at"] == requested_at.isoformat()
+
+    def test_mark_job_run_clears_manual_trigger_marker(self, tmp_cron_dir, monkeypatch):
+        requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: requested_at)
+        job = create_job(prompt="Manual interval", schedule="every 1h")
+        trigger_job(job["id"])
+
+        completed_at = requested_at + timedelta(minutes=5)
+        monkeypatch.setattr("cron.jobs._hermes_now", lambda: completed_at)
+        mark_job_run(job["id"], success=True)
+
+        updated = get_job(job["id"])
+        assert "manual_triggered_at" not in updated
+        assert updated["last_run_at"] == completed_at.isoformat()
+        assert updated["last_status"] == "ok"
+        assert datetime.fromisoformat(updated["next_run_at"]) > completed_at
 
 
 class TestAdvanceNextRun:

@@ -673,10 +673,17 @@ def resume_job(job_id: str) -> Optional[Dict[str, Any]]:
 
 
 def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
-    """Schedule a job to run on the next scheduler tick."""
+    """Schedule a job to run on the next scheduler tick.
+
+    Manual triggers are distinct from naturally missed recurring schedule
+    times.  Mark them explicitly so stale-run fast-forward logic never skips a
+    user-requested ``hermes cron run`` just because the gateway ticker was down
+    or blocked longer than the recurring schedule's catch-up grace window.
+    """
     job = get_job(job_id)
     if not job:
         return None
+    now = _hermes_now().isoformat()
     return update_job(
         job_id,
         {
@@ -684,7 +691,8 @@ def trigger_job(job_id: str) -> Optional[Dict[str, Any]]:
             "state": "scheduled",
             "paused_at": None,
             "paused_reason": None,
-            "next_run_at": _hermes_now().isoformat(),
+            "next_run_at": now,
+            "manual_triggered_at": now,
         },
     )
 
@@ -737,6 +745,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 
                 # Compute next run
                 job["next_run_at"] = compute_next_run(job["schedule"], now)
+                job.pop("manual_triggered_at", None)
 
                 # If no next run, decide whether this is terminal completion
                 # (one-shot) or a transient failure (recurring schedule couldn't
@@ -789,6 +798,8 @@ def advance_next_run(job_id: str) -> bool:
         jobs = load_jobs()
         for job in jobs:
             if job["id"] == job_id:
+                if job.get("manual_triggered_at"):
+                    return False
                 kind = job.get("schedule", {}).get("kind")
                 if kind not in ("cron", "interval"):
                     return False
@@ -870,6 +881,15 @@ def _get_due_jobs_locked() -> List[Dict[str, Any]]:
         if next_run_dt <= now:
             schedule = job.get("schedule", {})
             kind = schedule.get("kind")
+            manual_triggered = bool(job.get("manual_triggered_at"))
+
+            # A manual `hermes cron run` request is a user-requested run, not a
+            # stale naturally scheduled occurrence.  It must execute even if the
+            # gateway ticker was stopped or blocked longer than the recurring
+            # schedule's catch-up grace window.
+            if manual_triggered:
+                due.append(job)
+                continue
 
             # For recurring jobs, check if the scheduled time is stale
             # (gateway was down and missed the window). Fast-forward to
