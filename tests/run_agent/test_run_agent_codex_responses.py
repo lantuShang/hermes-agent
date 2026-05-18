@@ -308,7 +308,7 @@ def test_build_api_kwargs_codex(monkeypatch):
     assert kwargs["parallel_tool_calls"] is True
     assert isinstance(kwargs["prompt_cache_key"], str)
     assert len(kwargs["prompt_cache_key"]) > 0
-    assert "timeout" not in kwargs
+    assert kwargs["timeout"] == 1800.0
     assert "max_tokens" not in kwargs
     assert "extra_body" not in kwargs
 
@@ -833,6 +833,17 @@ def test_preflight_codex_api_kwargs_rejects_unsupported_request_fields(monkeypat
     with pytest.raises(ValueError, match="unsupported field"):
         from agent.codex_responses_adapter import _preflight_codex_api_kwargs
         _preflight_codex_api_kwargs(kwargs)
+
+
+def test_preflight_codex_api_kwargs_preserves_transport_timeout(monkeypatch):
+    agent = _build_agent(monkeypatch)
+    kwargs = _codex_request_kwargs()
+    kwargs["timeout"] = 1800.0
+
+    from agent.codex_responses_adapter import _preflight_codex_api_kwargs
+    result = _preflight_codex_api_kwargs(kwargs)
+
+    assert result["timeout"] == 1800.0
 
 
 def test_preflight_codex_api_kwargs_allows_reasoning_and_temperature(monkeypatch):

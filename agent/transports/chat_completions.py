@@ -260,6 +260,7 @@ class ChatCompletionsTransport(ProviderTransport):
         is_kimi = params.get("is_kimi", False)
         is_tokenhub = params.get("is_tokenhub", False)
         reasoning_config = params.get("reasoning_config")
+        base_url = params.get("base_url")
 
         if ephemeral is not None and max_tokens_fn:
             api_kwargs.update(max_tokens_fn(ephemeral))
@@ -282,6 +283,25 @@ class ChatCompletionsTransport(ProviderTransport):
                     if _e in ("low", "medium", "high"):
                         _kimi_effort = _e
                 api_kwargs["reasoning_effort"] = _kimi_effort
+
+        # CrofAI: OpenAI-compatible endpoint with top-level reasoning_effort.
+        # Its precision reasoning models may return only reasoning_content when
+        # the field is omitted, so default to "none" for normal Hermes turns
+        # unless the user explicitly configured low/medium/high reasoning.
+        if "crof.ai" in str(base_url or "").strip().lower():
+            _crof_effort = "none"
+            if reasoning_config and isinstance(reasoning_config, dict):
+                if reasoning_config.get("enabled") is False:
+                    _crof_effort = "none"
+                else:
+                    _e = str(reasoning_config.get("effort") or "").strip().lower()
+                    if _e == "minimal":
+                        _crof_effort = "low"
+                    elif _e == "xhigh":
+                        _crof_effort = "high"
+                    elif _e in {"low", "medium", "high", "none"}:
+                        _crof_effort = _e
+            api_kwargs["reasoning_effort"] = _crof_effort
 
         # Tencent TokenHub: top-level reasoning_effort (unless thinking disabled)
         if is_tokenhub:

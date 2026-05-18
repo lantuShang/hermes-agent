@@ -675,7 +675,7 @@ def _preflight_codex_api_kwargs(
         "model", "instructions", "input", "tools", "store",
         "reasoning", "include", "max_output_tokens", "temperature",
         "tool_choice", "parallel_tool_calls", "prompt_cache_key", "service_tier",
-        "extra_headers",
+        "extra_headers", "timeout",
     }
     normalized: Dict[str, Any] = {
         "model": model,
@@ -685,6 +685,14 @@ def _preflight_codex_api_kwargs(
     }
     if normalized_tools is not None:
         normalized["tools"] = normalized_tools
+
+    # Preserve SDK-level per-request timeout.  The OpenAI SDK consumes this as
+    # transport metadata rather than serializing it into the JSON request body.
+    timeout = api_kwargs.get("timeout")
+    if timeout is not None:
+        if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or timeout <= 0:
+            raise ValueError("Codex Responses request 'timeout' must be a positive number when provided.")
+        normalized["timeout"] = float(timeout)
 
     # Pass through reasoning config
     reasoning = api_kwargs.get("reasoning")

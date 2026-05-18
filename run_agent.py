@@ -8684,6 +8684,7 @@ class AIAgent:
                 tools=self.tools,
                 reasoning_config=self.reasoning_config,
                 session_id=getattr(self, "session_id", None),
+                timeout=self._resolved_api_call_timeout(),
                 max_tokens=self.max_tokens,
                 request_overrides=self.request_overrides,
                 is_github_responses=is_github_responses,

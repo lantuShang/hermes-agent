@@ -1114,6 +1114,27 @@ _CODEX_OAUTH_CONTEXT_FALLBACK: Dict[str, int] = {
     "gpt-5": 272_000,
 }
 
+# Local Codex-only context override.  ChatGPT Codex's live /models endpoint
+# currently reports 272K for gpt-5.4, but this installation intentionally
+# budgets gpt-5.4 at 500K so Hermes compresses less aggressively for that
+# exact Codex slug.  This does not change the upstream backend limit; if the
+# backend rejects >272K, overflow handling/probe-down still has to recover.
+_CODEX_OAUTH_CONTEXT_OVERRIDES: Dict[str, int] = {
+    "gpt-5.4": 500_000,
+}
+
+
+def _resolve_codex_oauth_context_override(model: str) -> Optional[int]:
+    """Return a local Codex OAuth context override for an exact model slug."""
+    model_bare = _strip_provider_prefix(model).strip()
+    if not model_bare:
+        return None
+    model_lower = model_bare.lower()
+    for slug, ctx in _CODEX_OAUTH_CONTEXT_OVERRIDES.items():
+        if model_lower == slug.lower():
+            return ctx
+    return None
+
 
 _codex_oauth_context_cache: Dict[str, int] = {}
 _codex_oauth_context_cache_time: float = 0.0
@@ -1182,6 +1203,10 @@ def _resolve_codex_oauth_context_length(
     model_bare = _strip_provider_prefix(model).strip()
     if not model_bare:
         return None
+
+    override_ctx = _resolve_codex_oauth_context_override(model_bare)
+    if override_ctx:
+        return override_ctx
 
     if access_token:
         live = _fetch_codex_oauth_context_lengths(access_token)
@@ -1293,19 +1318,33 @@ def get_model_context_length(
     if base_url and provider != "lmstudio":
         cached = get_cached_context_length(model, base_url)
         if cached is not None:
-            # Invalidate stale Codex OAuth cache entries: pre-PR #14935 builds
-            # resolved gpt-5.x to the direct-API value (e.g. 1.05M) via
-            # models.dev and persisted it. Codex OAuth caps at 272K for every
-            # slug, so any cached Codex entry at or above 400K is a leftover
-            # from the old resolution path. Drop it and fall through to the
-            # live /models probe in step 5 below.
-            if provider == "openai-codex" and cached >= 400_000:
-                logger.info(
-                    "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
-                    "re-resolving via live /models probe",
-                    model, base_url, f"{cached:,}",
-                )
-                _invalidate_cached_context_length(model, base_url)
+            # Local Codex overrides must beat persistent cache entries.  This
+            # matters for existing caches that already stored gpt-5.4 at 272K,
+            # and for the older stale >=400K guard below.
+            if provider == "openai-codex":
+                codex_override = _resolve_codex_oauth_context_override(model)
+                if codex_override:
+                    if cached == codex_override:
+                        return cached
+                    logger.info(
+                        "Dropping Codex cache entry %s@%s -> %s; local override is %s",
+                        model, base_url, f"{cached:,}", f"{codex_override:,}",
+                    )
+                    _invalidate_cached_context_length(model, base_url)
+                # Invalidate stale Codex OAuth cache entries: pre-PR #14935 builds
+                # resolved gpt-5.x to the direct-API value (e.g. 1.05M) via
+                # models.dev and persisted it. Codex OAuth caps at 272K for most
+                # slugs, so any cached Codex entry at or above 400K is a leftover
+                # from the old resolution path unless explicitly overridden above.
+                elif cached >= 400_000:
+                    logger.info(
+                        "Dropping stale Codex cache entry %s@%s -> %s (pre-fix value); "
+                        "re-resolving via live /models probe",
+                        model, base_url, f"{cached:,}",
+                    )
+                    _invalidate_cached_context_length(model, base_url)
+                else:
+                    return cached
             else:
                 return cached
 
