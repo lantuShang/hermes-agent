@@ -11,6 +11,8 @@ Provides speech-to-text transcription with six providers:
   - **mistral** — Mistral Voxtral Transcribe API, requires ``MISTRAL_API_KEY``.
   - **xai** — xAI Grok STT API, requires ``XAI_API_KEY``. High accuracy,
     Inverse Text Normalization, diarization, 21 languages.
+  - **zhipu** — Zhipu BigModel GLM-ASR API, requires ``ZHIPU_API_KEY`` /
+    ``BIGMODEL_API_KEY`` or a macOS Keychain item.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -32,6 +34,7 @@ import shlex
 import shutil
 import subprocess
 import tempfile
+import wave
 from pathlib import Path
 from typing import Optional, Dict, Any
 from urllib.parse import urljoin
@@ -84,6 +87,7 @@ DEFAULT_LOCAL_STT_LANGUAGE = "en"
 DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
+DEFAULT_ZHIPU_STT_MODEL = os.getenv("STT_ZHIPU_MODEL", "glm-asr-2512")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -91,10 +95,15 @@ COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
 GROQ_BASE_URL = os.getenv("GROQ_BASE_URL", "https://api.groq.com/openai/v1")
 OPENAI_BASE_URL = os.getenv("STT_OPENAI_BASE_URL", "https://api.openai.com/v1")
 XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
+ZHIPU_STT_BASE_URL = os.getenv("ZHIPU_STT_BASE_URL", "https://open.bigmodel.cn/api")
+ZHIPU_KEYCHAIN_SERVICE = os.getenv("ZHIPU_KEYCHAIN_SERVICE", "zhipu-api-key")
+ZHIPU_KEYCHAIN_ACCOUNT = os.getenv("ZHIPU_KEYCHAIN_ACCOUNT", os.getenv("USER", ""))
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
 MAX_FILE_SIZE = 25 * 1024 * 1024  # 25 MB
+ZHIPU_MAX_AUDIO_SECONDS = 30.0
+ZHIPU_CHUNK_SECONDS = 29.0  # keep a small safety margin below the API's 30s cap
 
 # Known model sets for auto-correction
 OPENAI_MODELS = {"whisper-1", "gpt-4o-mini-transcribe", "gpt-4o-transcribe"}
@@ -134,6 +143,50 @@ def _has_openai_audio_backend() -> bool:
         return True
     except ValueError:
         return False
+
+
+def _resolve_zhipu_api_key(stt_config: Optional[dict] = None) -> str:
+    """Resolve a Zhipu/BigModel API key without requiring plaintext config.
+
+    Priority: explicit ``stt.zhipu.api_key`` (mainly for tests/backward
+    compatibility), env/.env (``ZHIPU_API_KEY`` or ``BIGMODEL_API_KEY``), then a
+    macOS Keychain generic-password item.  The Keychain path lets users keep
+    Hermes config secret-free while the gateway can still access STT.
+    """
+    if stt_config is None:
+        stt_config = _load_stt_config()
+    zhipu_cfg = stt_config.get("zhipu", {}) if isinstance(stt_config.get("zhipu"), dict) else {}
+
+    cfg_key = str(zhipu_cfg.get("api_key") or "").strip()
+    if cfg_key:
+        return cfg_key
+
+    env_key = str(get_env_value("ZHIPU_API_KEY") or get_env_value("BIGMODEL_API_KEY") or "").strip()
+    if env_key:
+        return env_key
+
+    service = str(zhipu_cfg.get("keychain_service") or ZHIPU_KEYCHAIN_SERVICE or "").strip()
+    account = str(zhipu_cfg.get("keychain_account") or ZHIPU_KEYCHAIN_ACCOUNT or "").strip()
+    if not service or not account:
+        return ""
+
+    security_bin = _find_binary("security")
+    if not security_bin:
+        return ""
+
+    try:
+        result = subprocess.run(
+            [security_bin, "find-generic-password", "-w", "-a", account, "-s", service],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+    except Exception:
+        return ""
+    if result.returncode != 0:
+        return ""
+    return result.stdout.strip()
 
 
 def _find_binary(binary_name: str) -> Optional[str]:
@@ -272,6 +325,15 @@ def _get_provider(stt_config: dict) -> str:
                 return "xai"
             logger.warning(
                 "STT provider 'xai' configured but no xAI credentials are available"
+            )
+            return "none"
+
+        if provider == "zhipu":
+            if _resolve_zhipu_api_key(stt_config):
+                return "zhipu"
+            logger.warning(
+                "STT provider 'zhipu' configured but no Zhipu credentials are available "
+                "(set ZHIPU_API_KEY/BIGMODEL_API_KEY or add a Keychain item)"
             )
             return "none"
 
@@ -807,6 +869,284 @@ def _transcribe_xai(file_path: str, model_name: str) -> Dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Provider: Zhipu BigModel (GLM-ASR)
+# ---------------------------------------------------------------------------
+
+
+def _zhipu_audio_mime(file_path: str) -> str:
+    suffix = Path(file_path).suffix.lower()
+    if suffix == ".mp3":
+        return "audio/mpeg"
+    if suffix == ".wav":
+        return "audio/wav"
+    return "application/octet-stream"
+
+
+def _prepare_zhipu_audio(file_path: str, work_dir: str) -> tuple[Optional[str], Optional[str]]:
+    """Normalize audio for Zhipu ASR, which accepts wav/mp3 uploads."""
+    audio_path = Path(file_path)
+    if audio_path.suffix.lower() in {".wav", ".mp3"}:
+        return file_path, None
+
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return None, "Zhipu STT requires .wav/.mp3 input or ffmpeg to convert other formats"
+
+    converted_path = os.path.join(work_dir, f"{audio_path.stem}.wav")
+    command = [ffmpeg, "-y", "-i", file_path, "-ar", "16000", "-ac", "1", converted_path]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+        return converted_path, None
+    except subprocess.CalledProcessError as e:
+        details = e.stderr.strip() or e.stdout.strip() or str(e)
+        logger.error("ffmpeg conversion failed for Zhipu STT input %s: %s", file_path, details)
+        return None, f"Failed to convert audio for Zhipu STT: {details}"
+
+
+def _wav_duration_seconds(file_path: str) -> Optional[float]:
+    try:
+        with wave.open(file_path, "rb") as wf:
+            frame_rate = wf.getframerate()
+            if frame_rate <= 0:
+                return None
+            return wf.getnframes() / float(frame_rate)
+    except Exception:
+        return None
+
+
+def _ffprobe_duration_seconds(file_path: str) -> Optional[float]:
+    ffprobe = _find_binary("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe,
+                "-v",
+                "error",
+                "-show_entries",
+                "format=duration",
+                "-of",
+                "default=noprint_wrappers=1:nokey=1",
+                file_path,
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        duration_text = result.stdout.strip()
+        if not duration_text:
+            return None
+        return float(duration_text)
+    except Exception:
+        return None
+
+
+def _audio_duration_seconds(file_path: str) -> Optional[float]:
+    if Path(file_path).suffix.lower() == ".wav":
+        duration = _wav_duration_seconds(file_path)
+        if duration is not None:
+            return duration
+    return _ffprobe_duration_seconds(file_path)
+
+
+def _split_wav_audio(file_path: str, work_dir: str, chunk_seconds: float = ZHIPU_CHUNK_SECONDS) -> tuple[list[str], Optional[str]]:
+    """Split a WAV file into <=chunk_seconds chunks using Python stdlib only."""
+    try:
+        with wave.open(file_path, "rb") as source:
+            params = source.getparams()
+            frame_rate = source.getframerate()
+            if frame_rate <= 0:
+                return [], "Cannot split WAV for Zhipu STT: invalid frame rate"
+            frames_per_chunk = max(1, int(frame_rate * chunk_seconds))
+            chunk_paths: list[str] = []
+            index = 0
+            while True:
+                frames = source.readframes(frames_per_chunk)
+                if not frames:
+                    break
+                chunk_path = os.path.join(work_dir, f"{Path(file_path).stem}-chunk-{index:03d}.wav")
+                with wave.open(chunk_path, "wb") as chunk:
+                    chunk.setparams(params)
+                    chunk.writeframes(frames)
+                chunk_paths.append(chunk_path)
+                index += 1
+    except Exception as e:
+        return [], f"Failed to split WAV for Zhipu STT: {e}"
+
+    if not chunk_paths:
+        return [], "Failed to split audio for Zhipu STT: no chunks produced"
+    return chunk_paths, None
+
+
+def _split_audio_with_ffmpeg(file_path: str, work_dir: str, chunk_seconds: float = ZHIPU_CHUNK_SECONDS) -> tuple[list[str], Optional[str]]:
+    ffmpeg = _find_ffmpeg_binary()
+    if not ffmpeg:
+        return [], "Zhipu STT requires ffmpeg to split audio longer than 30 seconds"
+
+    output_pattern = os.path.join(work_dir, f"{Path(file_path).stem}-chunk-%03d.wav")
+    command = [
+        ffmpeg,
+        "-y",
+        "-i",
+        file_path,
+        "-f",
+        "segment",
+        "-segment_time",
+        str(chunk_seconds),
+        "-reset_timestamps",
+        "1",
+        "-ar",
+        "16000",
+        "-ac",
+        "1",
+        output_pattern,
+    ]
+    try:
+        subprocess.run(command, check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as e:
+        details = e.stderr.strip() or e.stdout.strip() or str(e)
+        logger.error("ffmpeg split failed for Zhipu STT input %s: %s", file_path, details)
+        return [], f"Failed to split audio for Zhipu STT: {details}"
+
+    chunk_paths = sorted(str(path) for path in Path(work_dir).glob(f"{Path(file_path).stem}-chunk-*.wav"))
+    if not chunk_paths:
+        return [], "Failed to split audio for Zhipu STT: no chunks produced"
+    return chunk_paths, None
+
+
+def _prepare_zhipu_upload_paths(file_path: str, work_dir: str) -> tuple[list[str], Optional[str]]:
+    prepared_input, prep_error = _prepare_zhipu_audio(file_path, work_dir)
+    if prep_error:
+        return [], prep_error
+    if not prepared_input:
+        return [], "Failed to prepare audio for Zhipu STT"
+
+    duration = _audio_duration_seconds(prepared_input)
+    if duration is None or duration <= ZHIPU_MAX_AUDIO_SECONDS:
+        return [prepared_input], None
+
+    logger.info(
+        "Splitting %s into %.0fs chunks for Zhipu STT because duration %.1fs exceeds %.0fs API limit",
+        Path(file_path).name,
+        ZHIPU_CHUNK_SECONDS,
+        duration,
+        ZHIPU_MAX_AUDIO_SECONDS,
+    )
+    if Path(prepared_input).suffix.lower() == ".wav":
+        return _split_wav_audio(prepared_input, work_dir)
+    return _split_audio_with_ffmpeg(prepared_input, work_dir)
+
+
+def _transcribe_zhipu(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using Zhipu BigModel GLM-ASR.
+
+    Calls ``POST /paas/v4/audio/transcriptions`` with multipart/form-data.
+    Official limits for ``glm-asr-2512`` are wav/mp3, <=25 MB, <=30 seconds.
+    Hermes validates the size and converts non-wav/mp3 inputs to wav when
+    ffmpeg is available; API-side duration errors are returned cleanly.
+    """
+    stt_config = _load_stt_config()
+    api_key = _resolve_zhipu_api_key(stt_config)
+    if not api_key:
+        return {
+            "success": False,
+            "transcript": "",
+            "error": "No Zhipu credentials found. Set ZHIPU_API_KEY/BIGMODEL_API_KEY or configure a Keychain item",
+        }
+
+    zhipu_cfg = stt_config.get("zhipu", {}) if isinstance(stt_config.get("zhipu"), dict) else {}
+    base_url = str(
+        zhipu_cfg.get("base_url")
+        or get_env_value("ZHIPU_STT_BASE_URL")
+        or ZHIPU_STT_BASE_URL
+    ).strip().rstrip("/")
+
+    data_items: list[tuple[str, str]] = [("model", model_name), ("stream", "false")]
+    prompt = str(zhipu_cfg.get("prompt") or "").strip()
+    if prompt:
+        data_items.append(("prompt", prompt))
+    request_id = str(zhipu_cfg.get("request_id") or "").strip()
+    if request_id:
+        data_items.append(("request_id", request_id))
+    user_id = str(zhipu_cfg.get("user_id") or "").strip()
+    if user_id:
+        data_items.append(("user_id", user_id))
+    hotwords = zhipu_cfg.get("hotwords")
+    if isinstance(hotwords, (list, tuple)):
+        for word in hotwords[:100]:
+            word_text = str(word).strip()
+            if word_text:
+                data_items.append(("hotwords", word_text))
+
+    try:
+        import requests
+
+        with tempfile.TemporaryDirectory(prefix="hermes-zhipu-stt-") as work_dir:
+            upload_paths, prep_error = _prepare_zhipu_upload_paths(file_path, work_dir)
+            if prep_error:
+                return {"success": False, "transcript": "", "error": prep_error}
+
+            transcripts: list[str] = []
+            total_chunks = len(upload_paths)
+            for index, upload_path in enumerate(upload_paths, start=1):
+                with open(upload_path, "rb") as audio_file:
+                    response = requests.post(
+                        f"{base_url}/paas/v4/audio/transcriptions",
+                        headers={"Authorization": f"Bearer {api_key}"},
+                        files={
+                            "file": (Path(upload_path).name, audio_file, _zhipu_audio_mime(upload_path)),
+                        },
+                        data=data_items,
+                        timeout=120,
+                    )
+
+                if response.status_code != 200:
+                    detail = ""
+                    try:
+                        err_body = response.json()
+                        raw_error = err_body.get("error") if isinstance(err_body, dict) else None
+                        if isinstance(raw_error, dict):
+                            detail = raw_error.get("message", "") or raw_error.get("code", "")
+                        detail = detail or response.text[:300]
+                    except Exception:
+                        detail = response.text[:300]
+                    chunk_prefix = f" chunk {index}/{total_chunks}" if total_chunks > 1 else ""
+                    return {
+                        "success": False,
+                        "transcript": "",
+                        "error": f"Zhipu STT API error{chunk_prefix} (HTTP {response.status_code}): {detail}",
+                    }
+
+                result = response.json()
+                transcript_text = _extract_transcript_text(result)
+                if not transcript_text:
+                    chunk_prefix = f" chunk {index}/{total_chunks}" if total_chunks > 1 else ""
+                    return {"success": False, "transcript": "", "error": f"Zhipu STT returned empty transcript{chunk_prefix}"}
+                transcripts.append(transcript_text)
+
+        transcript_text = " ".join(part.strip() for part in transcripts if part.strip()).strip()
+        if not transcript_text:
+            return {"success": False, "transcript": "", "error": "Zhipu STT returned empty transcript"}
+
+        logger.info(
+            "Transcribed %s via Zhipu GLM-ASR (%s, %d chars%s)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+            f", {len(transcripts)} chunks" if len(transcripts) > 1 else "",
+        )
+        return {"success": True, "transcript": transcript_text, "provider": "zhipu"}
+
+    except PermissionError:
+        return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
+    except Exception as e:
+        logger.error("Zhipu transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"Zhipu transcription failed: {e}"}
+
+
+# ---------------------------------------------------------------------------
 # Public API
 # ---------------------------------------------------------------------------
 
@@ -879,6 +1219,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         model_name = model or "grok-stt"
         return _transcribe_xai(file_path, model_name)
 
+    if provider == "zhipu":
+        zhipu_cfg = stt_config.get("zhipu", {})
+        model_name = model or zhipu_cfg.get("model", DEFAULT_ZHIPU_STT_MODEL)
+        return _transcribe_zhipu(file_path, model_name)
+
     # No provider available
     return {
         "success": False,
@@ -887,8 +1232,9 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "No STT provider available. Install faster-whisper for free local "
             f"transcription, configure {LOCAL_STT_COMMAND_ENV} or install a local whisper CLI, "
             "set GROQ_API_KEY for free Groq Whisper, set MISTRAL_API_KEY for Mistral "
-            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, or set VOICE_TOOLS_OPENAI_KEY "
-            "or OPENAI_API_KEY for the OpenAI Whisper API."
+            "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
+            "set ZHIPU_API_KEY/BIGMODEL_API_KEY or add a zhipu-api-key Keychain item for Zhipu GLM-ASR, "
+            "or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
 

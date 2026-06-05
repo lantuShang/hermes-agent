@@ -49,6 +49,9 @@ def clean_env(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     monkeypatch.delenv("GROQ_API_KEY", raising=False)
     monkeypatch.delenv("MISTRAL_API_KEY", raising=False)
+    monkeypatch.delenv("XAI_API_KEY", raising=False)
+    monkeypatch.delenv("ZHIPU_API_KEY", raising=False)
+    monkeypatch.delenv("BIGMODEL_API_KEY", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_COMMAND", raising=False)
     monkeypatch.delenv("HERMES_LOCAL_STT_LANGUAGE", raising=False)
 
@@ -1363,6 +1366,141 @@ class TestTranscribeAudioXAIDispatch:
             transcribe_audio(sample_ogg, model="custom-stt")
 
         assert mock_xai.call_args[0][1] == "custom-stt"
+
+
+# ============================================================================
+# _transcribe_zhipu / _get_provider — Zhipu GLM-ASR
+# ============================================================================
+
+class TestTranscribeZhipu:
+    def test_no_key(self, sample_wav):
+        with patch("tools.transcription_tools._load_stt_config", return_value={}), \
+             patch("tools.transcription_tools._resolve_zhipu_api_key", return_value=""):
+            from tools.transcription_tools import _transcribe_zhipu
+            result = _transcribe_zhipu(sample_wav, "glm-asr-2512")
+        assert result["success"] is False
+        assert "Zhipu credentials" in result["error"]
+
+    def test_successful_transcription(self, sample_wav):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"text": "你好，世界"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"zhipu": {}}), \
+             patch("tools.transcription_tools._resolve_zhipu_api_key", return_value="zhipu-test-key"), \
+             patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_zhipu
+            result = _transcribe_zhipu(sample_wav, "glm-asr-2512")
+
+        assert result["success"] is True
+        assert result["transcript"] == "你好，世界"
+        assert result["provider"] == "zhipu"
+        url = mock_post.call_args[0][0]
+        assert url.endswith("/paas/v4/audio/transcriptions")
+        data = mock_post.call_args.kwargs["data"]
+        assert ("model", "glm-asr-2512") in data
+        assert mock_post.call_args.kwargs["headers"]["Authorization"] == "Bearer zhipu-test-key"
+
+    def test_api_error_returns_failure(self, sample_wav):
+        mock_response = MagicMock()
+        mock_response.status_code = 400
+        mock_response.json.return_value = {"error": {"message": "audio too long"}}
+        mock_response.text = '{"error":{"message":"audio too long"}}'
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"zhipu": {}}), \
+             patch("tools.transcription_tools._resolve_zhipu_api_key", return_value="zhipu-test-key"), \
+             patch("requests.post", return_value=mock_response):
+            from tools.transcription_tools import _transcribe_zhipu
+            result = _transcribe_zhipu(sample_wav, "glm-asr-2512")
+
+        assert result["success"] is False
+        assert "HTTP 400" in result["error"]
+        assert "audio too long" in result["error"]
+
+    def test_hotwords_are_sent(self, sample_wav):
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {"text": "智谱"}
+        config = {"zhipu": {"hotwords": ["Hermes", "智谱"], "prompt": "上下文"}}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._resolve_zhipu_api_key", return_value="zhipu-test-key"), \
+             patch("requests.post", return_value=mock_response) as mock_post:
+            from tools.transcription_tools import _transcribe_zhipu
+            _transcribe_zhipu(sample_wav, "glm-asr-2512")
+
+        data = mock_post.call_args.kwargs["data"]
+        assert ("prompt", "上下文") in data
+        assert ("hotwords", "Hermes") in data
+        assert ("hotwords", "智谱") in data
+
+    def test_long_wav_is_split_and_transcripts_are_merged(self, tmp_path):
+        """Zhipu rejects audio over 30s, so long WAV input should be chunked."""
+        long_wav = tmp_path / "long.wav"
+        sample_rate = 16000
+        n_frames = sample_rate * 31
+        silence = struct.pack(f"<{n_frames}h", *([0] * n_frames))
+        with wave.open(str(long_wav), "wb") as wf:
+            wf.setnchannels(1)
+            wf.setsampwidth(2)
+            wf.setframerate(sample_rate)
+            wf.writeframes(silence)
+
+        response_1 = MagicMock()
+        response_1.status_code = 200
+        response_1.json.return_value = {"text": "第一段"}
+        response_2 = MagicMock()
+        response_2.status_code = 200
+        response_2.json.return_value = {"text": "第二段"}
+
+        with patch("tools.transcription_tools._load_stt_config", return_value={"zhipu": {}}), \
+             patch("tools.transcription_tools._resolve_zhipu_api_key", return_value="zhipu-test-key"), \
+             patch("requests.post", side_effect=[response_1, response_2]) as mock_post:
+            from tools.transcription_tools import _transcribe_zhipu
+            result = _transcribe_zhipu(str(long_wav), "glm-asr-2512")
+
+        assert result["success"] is True
+        assert result["transcript"] == "第一段 第二段"
+        assert result["provider"] == "zhipu"
+        assert mock_post.call_count == 2
+
+
+class TestGetProviderZhipu:
+    def test_zhipu_when_env_key_set(self, monkeypatch):
+        monkeypatch.setenv("ZHIPU_API_KEY", "zhipu-test-key")
+        from tools.transcription_tools import _get_provider
+        assert _get_provider({"provider": "zhipu"}) == "zhipu"
+
+    def test_zhipu_explicit_no_key_returns_none(self):
+        with patch("tools.transcription_tools._resolve_zhipu_api_key", return_value=""):
+            from tools.transcription_tools import _get_provider
+            assert _get_provider({"provider": "zhipu"}) == "none"
+
+
+class TestTranscribeAudioZhipuDispatch:
+    def test_dispatches_to_zhipu(self, sample_ogg):
+        with patch("tools.transcription_tools._load_stt_config", return_value={"provider": "zhipu"}), \
+             patch("tools.transcription_tools._get_provider", return_value="zhipu"), \
+             patch("tools.transcription_tools._transcribe_zhipu",
+                   return_value={"success": True, "transcript": "hi", "provider": "zhipu"}) as mock_zhipu:
+            from tools.transcription_tools import transcribe_audio
+            result = transcribe_audio(sample_ogg)
+
+        assert result["success"] is True
+        assert result["provider"] == "zhipu"
+        mock_zhipu.assert_called_once()
+        assert mock_zhipu.call_args[0][1] == "glm-asr-2512"
+
+    def test_config_zhipu_model_used(self, sample_ogg):
+        config = {"provider": "zhipu", "zhipu": {"model": "glm-asr-2512"}}
+        with patch("tools.transcription_tools._load_stt_config", return_value=config), \
+             patch("tools.transcription_tools._get_provider", return_value="zhipu"), \
+             patch("tools.transcription_tools._transcribe_zhipu",
+                   return_value={"success": True, "transcript": "hi"}) as mock_zhipu:
+            from tools.transcription_tools import transcribe_audio
+            transcribe_audio(sample_ogg, model=None)
+
+        assert mock_zhipu.call_args[0][1] == "glm-asr-2512"
 
 
 # ============================================================================
