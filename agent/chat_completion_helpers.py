@@ -636,7 +636,6 @@ def build_api_kwargs(agent, api_messages: list) -> dict:
             session_id=getattr(agent, "session_id", None),
             timeout=agent._resolved_api_call_timeout(),
             max_tokens=agent.max_tokens,
-            timeout=agent._resolved_api_call_timeout(),
             request_overrides=agent.request_overrides,
             is_github_responses=is_github_responses,
             is_codex_backend=is_codex_backend,
