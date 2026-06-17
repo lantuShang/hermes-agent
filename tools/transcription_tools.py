@@ -13,6 +13,7 @@ Provides speech-to-text transcription with six providers:
     Inverse Text Normalization, diarization, 21 languages.
   - **zhipu** — Zhipu BigModel GLM-ASR API, requires ``ZHIPU_API_KEY`` /
     ``BIGMODEL_API_KEY`` or a macOS Keychain item.
+  - **elevenlabs** — ElevenLabs Scribe API, requires ``ELEVENLABS_API_KEY``.
 
 Used by the messaging gateway to automatically transcribe voice messages
 sent by users on Telegram, Discord, WhatsApp, Slack, and Signal.
@@ -92,6 +93,7 @@ DEFAULT_STT_MODEL = os.getenv("STT_OPENAI_MODEL", "whisper-1")
 DEFAULT_GROQ_STT_MODEL = os.getenv("STT_GROQ_MODEL", "whisper-large-v3-turbo")
 DEFAULT_MISTRAL_STT_MODEL = os.getenv("STT_MISTRAL_MODEL", "voxtral-mini-latest")
 DEFAULT_ZHIPU_STT_MODEL = os.getenv("STT_ZHIPU_MODEL", "glm-asr-2512")
+DEFAULT_ELEVENLABS_STT_MODEL = os.getenv("STT_ELEVENLABS_MODEL", "scribe_v2")
 LOCAL_STT_COMMAND_ENV = "HERMES_LOCAL_STT_COMMAND"
 LOCAL_STT_LANGUAGE_ENV = "HERMES_LOCAL_STT_LANGUAGE"
 COMMON_LOCAL_BIN_DIRS = ("/opt/homebrew/bin", "/usr/local/bin")
@@ -102,6 +104,7 @@ XAI_STT_BASE_URL = os.getenv("XAI_STT_BASE_URL", "https://api.x.ai/v1")
 ZHIPU_STT_BASE_URL = os.getenv("ZHIPU_STT_BASE_URL", "https://open.bigmodel.cn/api")
 ZHIPU_KEYCHAIN_SERVICE = os.getenv("ZHIPU_KEYCHAIN_SERVICE", "zhipu-api-key")
 ZHIPU_KEYCHAIN_ACCOUNT = os.getenv("ZHIPU_KEYCHAIN_ACCOUNT", os.getenv("USER", ""))
+ELEVENLABS_STT_BASE_URL = os.getenv("ELEVENLABS_STT_BASE_URL", "https://api.elevenlabs.io/v1")
 
 SUPPORTED_FORMATS = {".mp3", ".mp4", ".mpeg", ".mpga", ".m4a", ".wav", ".webm", ".ogg", ".aac", ".flac"}
 LOCAL_NATIVE_AUDIO_FORMATS = {".wav", ".aiff", ".aif"}
@@ -845,16 +848,11 @@ def _get_provider(stt_config: dict) -> str:
             return "none"
 
         if provider == "mistral":
-            # `mistralai` PyPI package was quarantined on 2026-05-12 after a
-            # malicious 2.4.6 release. Refuse to use this provider until it's
-            # available again so we surface a clear message instead of an
-            # opaque ImportError mid-call.
+            if _HAS_MISTRAL and get_env_value("MISTRAL_API_KEY"):
+                return "mistral"
             logger.warning(
-                "STT provider 'mistral' (Voxtral Transcribe) is temporarily "
-                "disabled — `mistralai` PyPI package is quarantined "
-                "(malicious 2.4.6 release on 2026-05-12). Falling back to "
-                "another provider. Set stt.provider in config.yaml to 'local' "
-                "or 'openai' to silence this warning."
+                "STT provider 'mistral' configured but mistralai package "
+                "not installed or MISTRAL_API_KEY not set"
             )
             return "none"
 
@@ -877,9 +875,17 @@ def _get_provider(stt_config: dict) -> str:
             )
             return "none"
 
+        if provider == "elevenlabs":
+            if get_env_value("ELEVENLABS_API_KEY"):
+                return "elevenlabs"
+            logger.warning(
+                "STT provider 'elevenlabs' configured but ELEVENLABS_API_KEY not set"
+            )
+            return "none"
+
         return provider  # Unknown — let it fail downstream
 
-    # --- Auto-detect (no explicit provider): local > groq > openai > xai ---
+    # --- Auto-detect (no explicit provider): local > groq > openai > xai > elevenlabs -
     # mistral is intentionally skipped while `mistralai` is quarantined on
     # PyPI (malicious 2.4.6 release on 2026-05-12).
 
@@ -896,6 +902,12 @@ def _get_provider(stt_config: dict) -> str:
     if _HAS_OPENAI and _has_openai_audio_backend():
         logger.info("No local STT available, using OpenAI Whisper API")
         return "openai"
+    # Only auto-select Mistral if the SDK is already present — don't trigger a
+    # lazy-install during passive auto-detection. Explicit `provider: mistral`
+    # (above) does lazy-install on first transcription call.
+    if _HAS_MISTRAL and get_env_value("MISTRAL_API_KEY"):
+        logger.info("No local STT available, using Mistral Voxtral Transcribe API")
+        return "mistral"
     try:
         from tools.xai_http import resolve_xai_http_credentials
 
@@ -904,6 +916,9 @@ def _get_provider(stt_config: dict) -> str:
             return "xai"
     except Exception:
         pass
+    if get_env_value("ELEVENLABS_API_KEY"):
+        logger.info("No local STT available, using ElevenLabs Scribe STT API")
+        return "elevenlabs"
     return "none"
 
 
@@ -1433,6 +1448,11 @@ def _transcribe_mistral(file_path: str, model_name: str) -> Dict[str, Any]:
         return {"success": False, "transcript": "", "error": "MISTRAL_API_KEY not set"}
 
     try:
+        try:
+            from tools.lazy_deps import ensure as _lazy_ensure
+            _lazy_ensure("stt.mistral", prompt=False)
+        except ImportError:
+            pass
         from mistralai.client import Mistral
 
         with Mistral(api_key=api_key) as client:
@@ -1774,6 +1794,26 @@ def _transcribe_zhipu(file_path: str, model_name: str) -> Dict[str, Any]:
             word_text = str(word).strip()
             if word_text:
                 data_items.append(("hotwords", word_text))
+# Provider: ElevenLabs (Scribe STT API)
+# ---------------------------------------------------------------------------
+
+
+def _transcribe_elevenlabs(file_path: str, model_name: str) -> Dict[str, Any]:
+    """Transcribe using ElevenLabs Scribe STT API."""
+    api_key = get_env_value("ELEVENLABS_API_KEY")
+    if not api_key:
+        return {"success": False, "transcript": "", "error": "ELEVENLABS_API_KEY not set"}
+
+    stt_config = _load_stt_config()
+    elevenlabs_config = stt_config.get("elevenlabs", {})
+    base_url = str(
+        elevenlabs_config.get("base_url")
+        or get_env_value("ELEVENLABS_STT_BASE_URL")
+        or ELEVENLABS_STT_BASE_URL
+    ).strip().rstrip("/")
+    language_code = str(elevenlabs_config.get("language_code") or "").strip()
+    tag_audio_events = is_truthy_value(elevenlabs_config.get("tag_audio_events", False))
+    diarize = is_truthy_value(elevenlabs_config.get("diarize", False))
 
     try:
         import requests
@@ -1833,12 +1873,67 @@ def _transcribe_zhipu(file_path: str, model_name: str) -> Dict[str, Any]:
             f", {len(transcripts)} chunks" if len(transcripts) > 1 else "",
         )
         return {"success": True, "transcript": transcript_text, "provider": "zhipu"}
+        data: Dict[str, str] = {
+            "model_id": model_name,
+            "tag_audio_events": "true" if tag_audio_events else "false",
+            "diarize": "true" if diarize else "false",
+        }
+        if language_code:
+            data["language_code"] = language_code
+
+        with open(file_path, "rb") as audio_file:
+            response = requests.post(
+                f"{base_url}/speech-to-text",
+                headers={"xi-api-key": api_key},
+                files={"file": (Path(file_path).name, audio_file)},
+                data=data,
+                timeout=120,
+            )
+
+        if response.status_code != 200:
+            detail = ""
+            try:
+                err_body = response.json()
+                error_value = err_body.get("detail") or err_body.get("error")
+                if isinstance(error_value, dict):
+                    detail = str(error_value.get("message") or error_value)
+                elif error_value:
+                    detail = str(error_value)
+                else:
+                    detail = response.text[:300]
+            except Exception:
+                detail = response.text[:300]
+            return {
+                "success": False,
+                "transcript": "",
+                "error": f"ElevenLabs STT API error (HTTP {response.status_code}): {detail}",
+            }
+
+        result = response.json()
+        transcript_text = _extract_transcript_text(result)
+        if not transcript_text:
+            return {
+                "success": False,
+                "transcript": "",
+                "error": "ElevenLabs STT returned empty transcript",
+            }
+
+        logger.info(
+            "Transcribed %s via ElevenLabs Scribe (%s, %d chars)",
+            Path(file_path).name,
+            model_name,
+            len(transcript_text),
+        )
+
+        return {"success": True, "transcript": transcript_text, "provider": "elevenlabs"}
 
     except PermissionError:
         return {"success": False, "transcript": "", "error": f"Permission denied: {file_path}"}
     except Exception as e:
         logger.error("Zhipu transcription failed: %s", e, exc_info=True)
         return {"success": False, "transcript": "", "error": f"Zhipu transcription failed: {e}"}
+        logger.error("ElevenLabs STT transcription failed: %s", e, exc_info=True)
+        return {"success": False, "transcript": "", "error": f"ElevenLabs STT transcription failed: {e}"}
 
 
 # ---------------------------------------------------------------------------
@@ -1852,7 +1947,7 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
 
     Provider priority:
       1. User config (``stt.provider`` in config.yaml)
-      2. Auto-detect: local faster-whisper (free) > Groq (free tier) > OpenAI (paid)
+      2. Auto-detect: local > Groq > OpenAI > Mistral > xAI > ElevenLabs
 
     Args:
         file_path: Absolute path to the audio file to transcribe.
@@ -1918,6 +2013,11 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
         zhipu_cfg = stt_config.get("zhipu", {})
         model_name = model or zhipu_cfg.get("model", DEFAULT_ZHIPU_STT_MODEL)
         return _transcribe_zhipu(file_path, model_name)
+    if provider == "elevenlabs":
+        elevenlabs_cfg = stt_config.get("elevenlabs", {})
+        model_name = model or elevenlabs_cfg.get("model_id", DEFAULT_ELEVENLABS_STT_MODEL)
+        return _transcribe_elevenlabs(file_path, model_name)
+
     # User-declared command-type provider
     # (``stt.providers.<name>: type: command``). Fires after the built-in
     # elif chain — built-in names short-circuit upstream so a user's
@@ -1971,6 +2071,8 @@ def transcribe_audio(file_path: str, model: Optional[str] = None) -> Dict[str, A
             "Voxtral Transcribe, configure xAI OAuth or set XAI_API_KEY for xAI Grok STT, "
             "set ZHIPU_API_KEY/BIGMODEL_API_KEY or add a zhipu-api-key Keychain item for Zhipu GLM-ASR, "
             "or set VOICE_TOOLS_OPENAI_KEY or OPENAI_API_KEY for the OpenAI Whisper API."
+            "set ELEVENLABS_API_KEY for ElevenLabs Scribe, or set VOICE_TOOLS_OPENAI_KEY "
+            "or OPENAI_API_KEY for the OpenAI Whisper API."
         ),
     }
 
