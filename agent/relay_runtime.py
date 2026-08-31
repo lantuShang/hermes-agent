@@ -427,6 +427,14 @@ class RelayHostRegistry:
                 return host
             try:
                 host = RelayRuntime(profile_key=key)
+            except ModuleNotFoundError as exc:
+                # The nemo_relay binding is an optional observability plugin;
+                # an uninstalled package is an expected, healthy state — do
+                # not spam agent.log with a WARNING + traceback every turn.
+                logger.debug(
+                    "Hermes Relay binding not installed (%s); using Noop host", exc
+                )
+                host = NoopRelayRuntime(profile_key=key, reason=str(exc))
             except Exception as exc:
                 logger.warning(
                     "Hermes Relay runtime initialization failed", exc_info=True

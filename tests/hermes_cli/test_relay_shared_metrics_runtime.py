@@ -538,8 +538,11 @@ def test_execution_adapters_do_not_create_relay_host_without_a_consumer(
 
 
 def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, caplog):
+    import logging as _logging
+
     relay_shared_metrics._reset_for_tests()
     relay_runtime._reset_for_tests()
+    caplog.set_level(_logging.DEBUG, logger="agent.relay_runtime")
 
     def missing_relay(name: str):
         assert name == "nemo_relay"
@@ -558,7 +561,10 @@ def test_core_runtime_is_fail_open_without_a_published_binding(monkeypatch, capl
         args={"command": "true"},
     ) == {"command": "true"}
     assert not relay_runtime.emit_mark("hermes.probe", session_id="s1")
-    assert "Hermes Relay runtime initialization failed" in caplog.text
+    # A missing optional binding is a healthy state: logged at DEBUG, not
+    # WARNING with a traceback (it used to spam agent.log every turn).
+    assert "Hermes Relay binding not installed" in caplog.text
+    assert "Hermes Relay runtime initialization failed" not in caplog.text
     relay_runtime._reset_for_tests()
 
 
