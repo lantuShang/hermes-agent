@@ -749,10 +749,14 @@ class TestManualTrigger:
         """A manual trigger must not be treated as a stale missed schedule.
 
         `hermes cron run` can be issued while the gateway ticker is stopped,
-        blocked, or between long ticks.  Before the manual-trigger marker, a
+        blocked, or between long ticks.  Before the manual-run marker, a
         recurring job whose `next_run_at` was set to "now" could be
         fast-forwarded instead of executed once it was older than the recurring
         schedule's catch-up grace window.
+
+        Upstream (post-v0.20.3 fire-claim rework) implements this as the
+        string-exact `manual_run_at == next_run_at` marker; the due scan honors
+        it and skips the catch-up fast-forward.
         """
         pytest.importorskip("croniter")
         requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
@@ -763,7 +767,7 @@ class TestManualTrigger:
 
         assert triggered is not None
         assert triggered["next_run_at"] == requested_at.isoformat()
-        assert triggered["manual_triggered_at"] == requested_at.isoformat()
+        assert triggered["manual_run_at"] == requested_at.isoformat()
 
         # More than the 2h max catch-up grace for daily cron schedules.
         later = requested_at + timedelta(hours=3)
@@ -772,19 +776,33 @@ class TestManualTrigger:
         due = get_due_jobs()
 
         assert [j["id"] for j in due] == [job["id"]]
-        assert get_job(job["id"])["next_run_at"] == requested_at.isoformat()
 
-    def test_advance_next_run_does_not_consume_manual_trigger(self, tmp_cron_dir, monkeypatch):
-        """Scheduler pre-advance should not erase a pending manual run."""
+    def test_manual_run_marker_is_string_exact_with_next_run(self, tmp_cron_dir, monkeypatch):
+        """The manual-run marker must be invalidated by any next_run_at rewrite.
+
+        `_get_due_jobs_locked` compares `job.get("manual_run_at") == next_run`
+        on raw stored strings (intentionally NOT normalized datetimes): the
+        trigger stamps the same isoformat string into both fields, and any
+        later rewrite of next_run_at (schedule edit, recovery re-anchor,
+        fire-claim advance) must invalidate the marker so a *natural*
+        occurrence is never mistaken for a manual one.
+        """
         requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
         monkeypatch.setattr("cron.jobs._hermes_now", lambda: requested_at)
         job = create_job(prompt="Manual interval", schedule="every 1h")
-        trigger_job(job["id"])
+        triggered = trigger_job(job["id"])
+        assert triggered is not None
 
-        assert advance_next_run(job["id"]) is False
+        # String-exact identity between the two stamped fields.
+        assert triggered["manual_run_at"] == triggered["next_run_at"]
+
+        # A rewrite of next_run_at (here: the dispatcher's pre-advance)
+        # breaks the identity and therefore consumes the manual marker —
+        # crash-safety ordering (claim, then advance, then run) makes this
+        # safe in the real ticker loop.
+        assert advance_next_run(job["id"]) is True
         updated = get_job(job["id"])
-        assert updated["next_run_at"] == requested_at.isoformat()
-        assert updated["manual_triggered_at"] == requested_at.isoformat()
+        assert updated["next_run_at"] != requested_at.isoformat()
 
     def test_mark_job_run_clears_manual_trigger_marker(self, tmp_cron_dir, monkeypatch):
         requested_at = datetime(2026, 5, 7, 8, 0, tzinfo=timezone.utc)
@@ -797,7 +815,8 @@ class TestManualTrigger:
         mark_job_run(job["id"], success=True)
 
         updated = get_job(job["id"])
-        assert "manual_triggered_at" not in updated
+        assert "manual_run_at" not in updated
+        assert "manual_run_prompt" not in updated
         assert updated["last_run_at"] == completed_at.isoformat()
         assert updated["last_status"] == "ok"
         assert datetime.fromisoformat(updated["next_run_at"]) > completed_at
