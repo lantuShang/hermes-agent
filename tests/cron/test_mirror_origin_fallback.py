@@ -136,6 +136,16 @@ class TestFallbackMirrorEndToEnd:
             "platforms:\n  slack:\n    enabled: true\n    token: xoxb-test\n"
         )
         monkeypatch.setenv("HERMES_HOME", str(home))
+        # Scrub every platform home-channel var the host environment may leak
+        # (a gateway-inherited WEIXIN_HOME_CHANNEL makes deliver=all resolve a
+        # weixin target and fail on missing credentials).
+        for var in (
+            "TELEGRAM_HOME_CHANNEL",
+            "DISCORD_HOME_CHANNEL",
+            "WEIXIN_HOME_CHANNEL",
+            "FEISHU_HOME_CHANNEL",
+        ):
+            monkeypatch.delenv(var, raising=False)
 
         send_calls = []
 
