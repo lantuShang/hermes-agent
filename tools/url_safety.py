@@ -209,6 +209,36 @@ _MAX_SSRF_CONNECT_IPS = 8
 # VPNs, and some cloud internal networks.
 _CGNAT_NETWORK = ipaddress.ip_network("100.64.0.0/10")
 
+# 198.18.0.0/15 (IANA benchmarking space, RFC 2544) — non-routable test range.
+# Local proxies in TUN + fake-ip DNS mode (Clash, mihomo, Surge, sing-box,
+# Verge) rewrite DNS so that proxied hostnames resolve into this range
+# (e.g. help.openai.com -> 198.18.0.194) instead of their real address.
+# It is NOT a real private/internal target, so treating it as an SSRF hit is
+# a false positive that breaks legit outbound extraction on proxy hosts.
+# Blocked only when a proxy is NOT configured; when a proxy IS configured the
+# request is actually serviced by the proxy, which performs real DNS
+# resolution, so proxy fake-ip resolution is allowed through (same spirit as
+# the DNS-failure proxy escape above).
+_PROXY_FAKEIP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
+
+
+def _is_proxy_fakeip(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Return True when the IP is in the proxy fake-ip range AND a proxy is configured.
+
+    Local TUN-mode proxies answer DNS with a fake 198.18.0.0/15 address for any
+    proxied hostname. That range is RFC 2544 benchmarking space (not routable,
+    not a genuine private network), so blocking it would wrongfully reject
+    legitimate public URLs whenever the host runs a TUN proxy. Only exempt it
+    when a proxy is actually configured; on a proxy-free host this range is not
+    expected from DNS and should keep failing closed.
+    """
+    if not _proxy_is_configured():
+        return False
+    try:
+        return ip in _PROXY_FAKEIP_NETWORK
+    except TypeError:  # pragma: no cover — IPv6 not comparable to v4 network
+        return False
+
 # ---------------------------------------------------------------------------
 # Global toggle: allow private/internal IP resolution
 # ---------------------------------------------------------------------------
@@ -493,6 +523,15 @@ def is_safe_url(url: str) -> bool:
                 return False
 
             if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+                if _is_proxy_fakeip(ip):
+                    # Proxy fake-ip DNS (198.18.0.0/15) — legitimate public URL on a
+                    # TUN-proxy host; the request is serviced by the proxy which does
+                    # real resolution. Not an SSRF target.
+                    logger.debug(
+                        "Allowing proxy fake-ip resolution (198.18.0.0/15): %s -> %s",
+                        hostname, ip_str,
+                    )
+                    continue
                 logger.warning(
                     "Blocked request to private/internal address: %s -> %s",
                     hostname, ip_str,
@@ -582,6 +621,11 @@ def _resolved_http_connect_ips(host: str, port: int, scheme: str) -> list[str]:
             )
 
         if not allow_all_private and not allow_private_ip and _is_blocked_ip(ip):
+            if _is_proxy_fakeip(ip):
+                # Proxy fake-ip DNS (198.18.0.0/15) — legitimate public URL on a
+                # TUN-proxy host; the request is serviced by the proxy which does
+                # real resolution. Not an SSRF target.
+                continue
             raise SSRFConnectionBlocked(
                 f"Blocked request to private/internal address during connect: {hostname} -> {ip_str}"
             )
